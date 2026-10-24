@@ -291,6 +291,7 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.mem_cache.allocation import PrefillAllocationError
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
@@ -3729,6 +3730,54 @@ class Scheduler(
         else:
             checkpoint_kv_cache(req, self.tree_cache)
 
+    def _park_chunked_prefill_after_allocation_failure(self, reqs: list[Req]) -> bool:
+        """Roll back a failed extend and leave the chunk for a later retry.
+
+        The admission budget is sampled before HiCache pins settle, so a
+        continuation can lose capacity between admission and allocation. A
+        continuation already owns its KV row; resetting ``extend_end`` makes
+        the normal stash gate skip a second checkpoint, and keeping
+        ``chunked_req`` lets the next scheduler tick retry it. Fresh requests
+        from a mixed batch are returned to the waiting queue.
+        """
+        chunked_req = self.chunked_req
+        if chunked_req is None or chunked_req not in reqs:
+            return False
+
+        # A second existing row holder would be another in-flight continuation;
+        # leaving it in a newly constructed batch would lose its ownership state.
+        # The normal scheduler admits at most one such continuation alongside
+        # fresh requests, so defer that unsupported mixed shape to the original
+        # exception path instead of guessing at its lifecycle.
+        if any(req is not chunked_req and req.kv.holds_kv for req in reqs):
+            return False
+
+        chunked_req.inflight_middle_chunks = max(
+            0, chunked_req.inflight_middle_chunks - 1
+        )
+        if chunked_req.kv.holds_kv:
+            chunked_req.extend_end = chunked_req.prefix_len
+        else:
+            self.chunked_req = None
+
+        for req in reqs:
+            if req.kv.holds_kv:
+                continue
+            if req.lock is not None:
+                self.tree_cache.unlock(req.lock)
+                req.lock = None
+            req.extend_end = req.prefix_len
+            if req is not chunked_req:
+                self._add_request_to_queue(req)
+        if not chunked_req.kv.holds_kv:
+            self._add_request_to_queue(chunked_req)
+
+        logger.warning(
+            "Parking chunked prefill after KV allocation failed; retrying rid=%s",
+            chunked_req.rid,
+        )
+        return True
+
     def process_pending_chunked_abort(self) -> None:
         """Abort an in-flight chunked-prefill request once it is safe to do so.
 
@@ -4308,7 +4357,12 @@ class Scheduler(
                 self.tree_cache.ready_to_load_host_cache()
             )
 
-        new_batch.prepare_for_extend()
+        try:
+            new_batch.prepare_for_extend()
+        except PrefillAllocationError:
+            if self._park_chunked_prefill_after_allocation_failure(can_run_list):
+                return None, running_batch
+            raise
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
