@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import triton
 import triton.language as tl
-
 from sglang.kernels.ops.memory.common import (
     get_last_loc_triton,
     get_last_loc_triton_safe,
@@ -51,6 +50,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _EMPTY_PREFIX = torch.empty((0,), dtype=torch.int64)
+
+
+class PrefillAllocationError(RuntimeError):
+    """A prefill chunk could not obtain its KV slots at allocation time.
+
+    Admission is intentionally optimistic because HiCache pins can change
+    between the budget probe and the allocator call. The scheduler uses this
+    typed failure to park an in-progress chunk instead of terminating its
+    event loop.
+    """
 
 
 def write_cache_indices(
@@ -167,7 +176,7 @@ def alloc_token_slots(
         logger.error(error_msg)
         if tree_cache is not None:
             tree_cache.pretty_print()
-        raise RuntimeError(error_msg)
+        raise PrefillAllocationError(error_msg)
 
     return out_cache_loc
 
@@ -243,7 +252,7 @@ def alloc_paged_token_slots_extend(
         logger.error(error_msg)
         if tree_cache is not None:
             tree_cache.pretty_print()
-        raise RuntimeError(error_msg)
+        raise PrefillAllocationError(error_msg)
 
     if kv_shard_rotation_bases is not None:
         # The allocator resolved None entries (new chains) in place from the
@@ -402,6 +411,7 @@ def alloc_for_extend(
     extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
 
     # Allocate req slots (raises RuntimeError if the pool is exhausted)
+    had_req_pool_slots = [req.kv.holds_kv for req in batch.reqs]
     req_pool_indices = alloc_req_slots(
         batch.req_to_token_pool, batch.reqs, batch.tree_cache
     )
@@ -415,38 +425,55 @@ def alloc_for_extend(
     if batch.hisparse_coordinator is not None:
         batch.hisparse_coordinator.allocate_spec_scratch(req_pool_indices)
 
-    # Allocate KV cache (throws exception on failure)
-    alloc_page_size = _alloc_page_size(batch)
-    if reuse_kv is not None and any(reuse_kv):
-        out_cache_loc = _alloc_extend_loc_with_kv_reuse(
-            batch,
-            reuse_kv,
-            prefix_tensors,
-            req_pool_indices_cpu,
-            prefix_lens_cpu,
-            extend_lens_cpu,
-            req_pool_indices_device,
-            alloc_page_size,
-        )
-    elif alloc_page_size == 1:
-        out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
-    else:
-        # Paged allocation - build last_loc
-        last_loc = [
-            (t[-1:] if len(t) > 0 else torch.full((1,), -1, device=batch.device))
-            for t in prefix_tensors
-        ]
-        out_cache_loc = alloc_paged_token_slots_extend(
-            tree_cache=batch.tree_cache,
-            prefix_lens=prefix_lens_device,
-            prefix_lens_cpu=prefix_lens_cpu,
-            seq_lens=batch.seq_lens,
-            seq_lens_cpu=batch.seq_lens_cpu,
-            last_loc=torch.cat(last_loc),
-            extend_num_tokens=batch.extend_num_tokens,
-            req_pool_indices=req_pool_indices_device,
-            batch=batch,
-        )
+    # Allocate KV cache. A failed allocation must return any request-side
+    # resources acquired above before the scheduler decides whether to park the
+    # chunk. Continuing chunks reuse their existing rows and therefore need no
+    # row rollback here.
+    try:
+        alloc_page_size = _alloc_page_size(batch)
+        if reuse_kv is not None and any(reuse_kv):
+            out_cache_loc = _alloc_extend_loc_with_kv_reuse(
+                batch,
+                reuse_kv,
+                prefix_tensors,
+                req_pool_indices_cpu,
+                prefix_lens_cpu,
+                extend_lens_cpu,
+                req_pool_indices_device,
+                alloc_page_size,
+            )
+        elif alloc_page_size == 1:
+            out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
+        else:
+            # Paged allocation - build last_loc
+            last_loc = [
+                (t[-1:] if len(t) > 0 else torch.full((1,), -1, device=batch.device))
+                for t in prefix_tensors
+            ]
+            out_cache_loc = alloc_paged_token_slots_extend(
+                tree_cache=batch.tree_cache,
+                prefix_lens=prefix_lens_device,
+                prefix_lens_cpu=prefix_lens_cpu,
+                seq_lens=batch.seq_lens,
+                seq_lens_cpu=batch.seq_lens_cpu,
+                last_loc=torch.cat(last_loc),
+                extend_num_tokens=batch.extend_num_tokens,
+                req_pool_indices=req_pool_indices_device,
+                batch=batch,
+            )
+    except PrefillAllocationError:
+        for req, had_req_pool_slot in zip(batch.reqs, had_req_pool_slots):
+            if had_req_pool_slot or not req.kv.holds_kv:
+                continue
+            if batch.hisparse_coordinator is not None:
+                batch.hisparse_coordinator.free_unrotated_scratch(req.kv.req_pool_idx)
+            if (
+                hasattr(batch.req_to_token_pool, "free_mamba_cache")
+                and req.kv.holds_mamba
+            ):
+                batch.req_to_token_pool.free_mamba_cache(req)
+            batch.req_to_token_pool.free(req)
+        raise
 
     # Write to req_to_token_pool
     write_cache_indices(
